@@ -1,14 +1,14 @@
 """
-AetherAgent FastAPI Application Entry Point.
+AetherAgent FastAPI Application.
+This file should NEVER change after initial setup.
+All new features are added via src/backend/api/__init__.py
 """
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config.settings import settings
-from src.backend.api.auth import router as auth_router
-from src.backend.api.chat import router as chat_router
-from src.backend.api.hardware import router as hardware_router
+from src.backend.api import api_router
 from src.backend.database import init_db
 
 app = FastAPI(
@@ -26,9 +26,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth_router, prefix=settings.api_prefix)
-app.include_router(chat_router, prefix=settings.api_prefix)
-app.include_router(hardware_router, prefix=settings.api_prefix)
+# ONE LINE registers ALL API routes
+app.include_router(api_router, prefix=settings.api_prefix)
 
 
 @app.on_event("startup")
