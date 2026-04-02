@@ -1,8 +1,6 @@
 """
 AetherAgent Hardware Manager
 Detects CPU, GPU, RAM, Storage, and auto-configures inference parameters.
-Writes runtime configuration to ~/AetherAgent/runtime_config.json (WSL)
-or /etc/aetheragent/runtime_config.json (Native Linux).
 """
 
 import json
@@ -16,10 +14,6 @@ from typing import Optional
 
 import psutil
 
-
-# ---------------------------------------------------------------------------
-# Data Classes
-# ---------------------------------------------------------------------------
 
 @dataclass
 class CPUProfile:
@@ -78,16 +72,10 @@ class RuntimeConfig:
     config_path: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Detection Functions
-# ---------------------------------------------------------------------------
-
 def detect_cpu() -> CPUProfile:
     profile = CPUProfile()
     cores_per_socket = 0
     sockets = 0
-    threads_per_core = 1
-
     try:
         result = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=5)
         for line in result.stdout.splitlines():
@@ -101,7 +89,7 @@ def detect_cpu() -> CPUProfile:
             elif line.startswith("Socket(s):"):
                 sockets = int(line.split(":", 1)[1].strip())
             elif line.startswith("Thread(s) per core:"):
-                threads_per_core = int(line.split(":", 1)[1].strip())
+                pass
             elif line.startswith("CPU max MHz:"):
                 try:
                     profile.max_freq_mhz = float(line.split(":", 1)[1].strip())
@@ -115,14 +103,10 @@ def detect_cpu() -> CPUProfile:
             profile.physical_cores = cores_per_socket * sockets
     except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
         pass
-
-    # Fallback: psutil (most reliable for available threads)
     if profile.logical_cores == 0:
         profile.logical_cores = psutil.cpu_count(logical=True) or 4
     if profile.physical_cores == 0:
         profile.physical_cores = psutil.cpu_count(logical=False) or profile.logical_cores
-
-    # Detect SIMD via /proc/cpuinfo flags
     try:
         with open("/proc/cpuinfo", "r") as f:
             cpuinfo = f.read()
@@ -132,7 +116,6 @@ def detect_cpu() -> CPUProfile:
             profile.has_neon = "neon" in cpuinfo.lower()
     except FileNotFoundError:
         pass
-
     return profile
 
 
@@ -140,11 +123,8 @@ def detect_gpu() -> GPUProfile:
     profile = GPUProfile()
     try:
         result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=name,memory.total,memory.free,driver_version,temperature.gpu,utilization.gpu",
-                "--format=csv,noheader,nounits",
-            ],
+            ["nvidia-smi", "--query-gpu=name,memory.total,memory.free,driver_version,temperature.gpu,utilization.gpu",
+             "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode == 0:
@@ -157,7 +137,6 @@ def detect_gpu() -> GPUProfile:
                 profile.driver_version = parts[3]
                 profile.temperature_c = float(parts[4])
                 profile.utilization_pct = float(parts[5])
-
         result3 = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
         for line in result3.stdout.splitlines():
             if "CUDA Version:" in line:
@@ -170,10 +149,7 @@ def detect_gpu() -> GPUProfile:
 
 def detect_system() -> SystemProfile:
     profile = SystemProfile()
-    profile.is_wsl = (
-        os.path.exists("/proc/version")
-        and "microsoft" in open("/proc/version").read().lower()
-    )
+    profile.is_wsl = os.path.exists("/proc/version") and "microsoft" in open("/proc/version").read().lower()
     try:
         profile.architecture = subprocess.check_output(["uname", "-m"], text=True).strip()
     except Exception:
@@ -194,31 +170,14 @@ def detect_system() -> SystemProfile:
     return profile
 
 
-# ---------------------------------------------------------------------------
-# Auto-Configuration Logic
-# ---------------------------------------------------------------------------
-
 def calculate_inference_config(profile: SystemProfile) -> InferenceConfig:
-    """
-    Calculate optimal inference parameters based on hardware.
-
-    RTX 4060 8GB (8188 MB) / 16GB RAM:
-    - 7B Q5_K_M ≈ 4.8 GB → fits entirely in VRAM with 8K context
-    - 13B Q4_K_M ≈ 7.8 GB → needs GPU+CPU split for context room
-    """
     config = InferenceConfig()
-
-    # Use logical cores for thread count (WSL exposes threads, not physical cores)
     config.threads = max(4, profile.cpu.logical_cores - 2)
-
     if profile.gpu.vendor == "nvidia" and profile.gpu.vram_total_mb > 0:
         config.backend = "llama_cpp"
         vram_gb = profile.gpu.vram_total_mb / 1024.0
         ram_gb = profile.ram_total_gb
-
-        # FIX: Use >= 7500 MB (7.3 GB) to catch 8GB cards that report as 7999MB
         if profile.gpu.vram_total_mb >= 7500:
-            # 8GB VRAM tier (7680-8192 MB): 7B Q5_K_M fits entirely
             config.n_gpu_layers = -1
             config.quantization = "Q5_K_M"
             config.context_size = 8192
@@ -226,14 +185,12 @@ def calculate_inference_config(profile: SystemProfile) -> InferenceConfig:
             config.max_model_params_gb = round(vram_gb * 0.85, 1)
             config.use_mlock = False
         elif profile.gpu.vram_total_mb >= 6000:
-            # 6-8GB VRAM
             config.n_gpu_layers = -1
             config.quantization = "Q4_K_M"
             config.context_size = 4096
             config.batch_size = 256
             config.max_model_params_gb = round(vram_gb * 0.80, 1)
         else:
-            # <6GB VRAM: partial offload
             config.n_gpu_layers = 20
             config.quantization = "Q4_K_M"
             config.context_size = 4096
@@ -241,7 +198,6 @@ def calculate_inference_config(profile: SystemProfile) -> InferenceConfig:
             config.max_model_params_gb = round((vram_gb + (ram_gb * 0.3)) * 0.80, 1)
             config.use_mlock = True
     else:
-        # CPU-only fallback
         config.backend = "llama_cpp"
         config.n_gpu_layers = 0
         config.quantization = "Q4_K_M"
@@ -250,13 +206,8 @@ def calculate_inference_config(profile: SystemProfile) -> InferenceConfig:
         config.use_mlock = True
         config.max_model_params_gb = round(max(0, (profile.ram_total_gb - 4) * 0.70), 1)
         config.threads = profile.cpu.logical_cores
-
     return config
 
-
-# ---------------------------------------------------------------------------
-# Config Persistence
-# ---------------------------------------------------------------------------
 
 def get_config_path() -> Path:
     if os.path.exists("/proc/version") and "microsoft" in open("/proc/version").read().lower():
@@ -270,11 +221,22 @@ def load_runtime_config() -> RuntimeConfig:
         try:
             with open(config_path, "r") as f:
                 data = json.load(f)
-            return RuntimeConfig(
-                profile=SystemProfile(**data["profile"]),
-                inference=InferenceConfig(**data["inference"]),
-                config_path=str(config_path),
+            # FIX: Manually reconstruct nested dataclasses from dicts
+            p = data["profile"]
+            i = data["inference"]
+            profile = SystemProfile(
+                cpu=CPUProfile(**p["cpu"]),
+                gpu=GPUProfile(**p["gpu"]),
+                ram_total_gb=p["ram_total_gb"],
+                ram_available_gb=p["ram_available_gb"],
+                ram_used_pct=p["ram_used_pct"],
+                swap_total_gb=p["swap_total_gb"],
+                disk_free_gb=p["disk_free_gb"],
+                is_wsl=p["is_wsl"],
+                architecture=p["architecture"],
             )
+            inference = InferenceConfig(**i)
+            return RuntimeConfig(profile=profile, inference=inference, config_path=str(config_path))
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
     return build_and_save_config()
@@ -292,10 +254,6 @@ def build_and_save_config() -> RuntimeConfig:
         json.dump(data, f, indent=2)
     return config
 
-
-# ---------------------------------------------------------------------------
-# Real-Time Monitoring
-# ---------------------------------------------------------------------------
 
 class HardwareMonitor:
     def __init__(self, alert_callback=None, check_interval: int = 10):
@@ -338,9 +296,7 @@ class HardwareMonitor:
             gpu = detect_gpu()
             if gpu.vendor == "nvidia" and gpu.temperature_c > 85:
                 if self._should_alert("gpu_temp"):
-                    self._alert_callback(
-                        f"GPU WARNING: {gpu.model_name} at {gpu.temperature_c}°C (threshold: 85°C)"
-                    )
+                    self._alert_callback(f"GPU WARNING: {gpu.model_name} at {gpu.temperature_c}C")
         except Exception:
             pass
 
@@ -349,9 +305,7 @@ class HardwareMonitor:
             vm = psutil.virtual_memory()
             if vm.percent > 90:
                 if self._should_alert("ram_usage"):
-                    self._alert_callback(
-                        f"RAM WARNING: {vm.percent}% used ({vm.available / (1024**3):.1f}GB free)"
-                    )
+                    self._alert_callback(f"RAM WARNING: {vm.percent}% used ({vm.available / (1024**3):.1f}GB free)")
         except Exception:
             pass
 
@@ -371,15 +325,10 @@ class HardwareMonitor:
         }
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def print_hardware_report():
     config = build_and_save_config()
     p = config.profile
     i = config.inference
-
     print("=" * 60)
     print("  AETHERAGENT — Hardware Profile Report")
     print("=" * 60)
@@ -387,7 +336,7 @@ def print_hardware_report():
     print(f"  Environment  : {env} ({p.architecture})")
     print(f"  CPU          : {p.cpu.model_name}")
     print(f"  Cores        : {p.cpu.physical_cores}P / {p.cpu.logical_cores}L")
-    print(f"  SIMD         : AVX2={'✓' if p.cpu.has_avx2 else '✗'}  AVX-512={'✓' if p.cpu.has_avx512 else '✗'}  NEON={'✓' if p.cpu.has_neon else '✗'}")
+    print(f"  SIMD         : AVX2={'Y' if p.cpu.has_avx2 else 'N'}  AVX-512={'Y' if p.cpu.has_avx512 else 'N'}")
     print(f"  RAM          : {p.ram_total_gb} GB (available: {p.ram_available_gb} GB)")
     print(f"  Swap         : {p.swap_total_gb} GB")
     print(f"  Disk Free    : {p.disk_free_gb} GB")
@@ -397,7 +346,7 @@ def print_hardware_report():
         print(f"  Driver       : {p.gpu.driver_version}")
         print(f"  CUDA         : {p.gpu.cuda_version}")
     else:
-        print("  GPU          : None detected (CPU-only mode)")
+        print("  GPU          : None (CPU-only mode)")
     print("-" * 60)
     print("  INFERENCE CONFIGURATION")
     print("-" * 60)
@@ -408,8 +357,6 @@ def print_hardware_report():
     print(f"  Batch Size   : {i.batch_size}")
     print(f"  Threads      : {i.threads}")
     print(f"  Max Model    : ~{i.max_model_params_gb} GB params")
-    print(f"  mmap         : {'Enabled' if i.use_mmap else 'Disabled'}")
-    print(f"  mlock        : {'Enabled' if i.use_mlock else 'Disabled'}")
     print("=" * 60)
     print(f"  Config saved : {config.config_path}")
     print("=" * 60)

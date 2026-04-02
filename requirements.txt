@@ -35,6 +35,7 @@ diskcache==5.6.3
 dnspython==2.8.0
 EbookLib==0.20
 ecdsa==0.19.2
+email-validator==2.3.0
 et_xmlfile==2.0.0
 fastapi==0.135.2
 filelock==3.25.2
