@@ -36,3 +36,4 @@ Thumbs.db
 .vscode/settings.json
 .idea/
 *.swp
+runtime_config.json
